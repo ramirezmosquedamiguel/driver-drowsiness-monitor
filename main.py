@@ -6,11 +6,11 @@ Este script usa:
 - EAR (Eye Aspect Ratio) para estimar cierre ocular.
 
 Acciones implementadas al detectar somnolencia:
-1) Alarma sonora.
+1) Alarma sonora escalonada y no bloqueante.
 2) Activación de una acción de seguridad vehicular (simulada como "luces de emergencia").
 
 Requisitos:
-    pip install opencv-python mediapipe numpy
+    pip install opencv-python mediapipe numpy sounddevice
 """
 
 from __future__ import annotations
@@ -18,14 +18,14 @@ from __future__ import annotations
 import argparse
 import collections
 import dataclasses
-import platform
-import subprocess
+import threading
 import time
 from typing import Deque, Iterable, List, Sequence, Tuple
 
 import cv2
 import mediapipe as mp
 import numpy as np
+import sounddevice as sd
 
 
 # Índices de landmarks (MediaPipe FaceMesh) para cada ojo.
@@ -37,9 +37,8 @@ RIGHT_EYE_IDX = [362, 385, 387, 263, 373, 380]
 @dataclasses.dataclass
 class DrowsinessConfig:
     ear_threshold: float = 0.21
-    min_closed_seconds: float = 1.5
+    min_closed_seconds: float = 5.0
     fps_window: int = 30
-    cooldown_seconds: float = 8.0
 
 
 class SafetyAction:
@@ -50,24 +49,83 @@ class SafetyAction:
 
 
 class SoundAlarmAction(SafetyAction):
-    """Acción 1: Alarma sonora multiplataforma."""
+    """Acción 1: Alarma sonora en dos etapas usando ondas seno + sounddevice."""
 
-    def trigger(self) -> None:
-        system = platform.system().lower()
+    def __init__(self, sample_rate: int = 44100) -> None:
+        self.sample_rate = sample_rate
+        self._lock = threading.Lock()
+        self._active = False
+        self._closed_elapsed = 0.0
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+
+    def _build_tone(self, frequency: float, duration_s: float, amplitude: float) -> np.ndarray:
+        t = np.linspace(0.0, duration_s, int(self.sample_rate * duration_s), endpoint=False)
+        wave = amplitude * np.sin(2.0 * np.pi * frequency * t)
+        return wave.astype(np.float32)
+
+    def _play_tone(self, frequency: float, duration_s: float, amplitude: float) -> None:
+        tone = self._build_tone(frequency, duration_s, amplitude)
         try:
-            if "windows" in system:
-                import winsound
-
-                winsound.Beep(2500, 700)
-            elif "darwin" in system:
-                subprocess.run(["afplay", "/System/Library/Sounds/Glass.aiff"], check=False)
-            else:
-                # Linux/Unix: intenta beep, si no está disponible usa bell ASCII.
-                subprocess.run(["beep", "-f", "2500", "-l", "700"], check=False)
-                print("\a", end="", flush=True)
+            sd.play(tone, self.sample_rate, blocking=True)
         except Exception:
             # Fallback silencioso para no romper el bucle de monitoreo.
-            print("[ALERTA] No se pudo reproducir audio en este entorno.")
+            pass
+
+    def _sleep_interruptible(self, duration_s: float) -> None:
+        end_time = time.time() + duration_s
+        while time.time() < end_time:
+            if self._stop_event.wait(timeout=0.02):
+                return
+
+    def _worker(self) -> None:
+        emergency_toggle = False
+        while not self._stop_event.is_set():
+            with self._lock:
+                if not self._active:
+                    break
+                elapsed = self._closed_elapsed
+
+            if elapsed >= 15.0:
+                # Etapa 2: >15s cerrados -> más fuerte, más rápido y frecuencia alternante.
+                freq = 700.0 if emergency_toggle else 1200.0
+                emergency_toggle = not emergency_toggle
+                self._play_tone(frequency=freq, duration_s=0.4, amplitude=0.55)
+                if self._stop_event.is_set():
+                    break
+                self._sleep_interruptible(0.2)
+            else:
+                # Etapa 1: 5s-15s cerrados -> intermitente, amplitud moderada, cadencia lenta.
+                self._play_tone(frequency=800.0, duration_s=1.0, amplitude=0.28)
+                if self._stop_event.is_set():
+                    break
+                self._sleep_interruptible(1.0)
+
+        sd.stop()
+
+    def trigger(self) -> None:
+        with self._lock:
+            if self._active:
+                return
+            self._active = True
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def update_elapsed(self, elapsed: float) -> None:
+        with self._lock:
+            self._closed_elapsed = elapsed
+
+    def stop(self) -> None:
+        with self._lock:
+            self._active = False
+        self._stop_event.set()
+        sd.stop()
+
+    def close(self) -> None:
+        self.stop()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
 
 
 class HazardLightsAction(SafetyAction):
@@ -132,11 +190,12 @@ def run_monitor(config: DrowsinessConfig, camera_index: int) -> None:
     if not cap.isOpened():
         raise RuntimeError("No se pudo abrir la cámara. Verifica permisos/dispositivo.")
 
-    actions: List[SafetyAction] = [SoundAlarmAction(), HazardLightsAction()]
+    alarm_action = SoundAlarmAction()
+    hazard_action = HazardLightsAction()
 
     ear_values: Deque[float] = collections.deque(maxlen=config.fps_window)
     closed_start: float | None = None
-    last_trigger_time = 0.0
+    hazard_triggered = False
 
     print("Monitoreo iniciado. Presiona 'q' para salir.")
 
@@ -175,20 +234,20 @@ def run_monitor(config: DrowsinessConfig, camera_index: int) -> None:
                     if closed_start is None:
                         closed_start = now
                     elapsed = now - closed_start
+                    alarm_action.update_elapsed(elapsed)
                     status_text = f"Ojos cerrados ({elapsed:.1f}s)"
                     status_color = (0, 0, 255)
 
-                    should_trigger = (
-                        elapsed >= config.min_closed_seconds
-                        and (now - last_trigger_time) >= config.cooldown_seconds
-                    )
-                    if should_trigger:
-                        print("[ALERTA] Posible somnolencia detectada.")
-                        for action in actions:
-                            action.trigger()
-                        last_trigger_time = now
+                    if elapsed >= config.min_closed_seconds:
+                        alarm_action.trigger()
+                        if not hazard_triggered:
+                            print("[ALERTA] Posible somnolencia detectada.")
+                            hazard_action.trigger()
+                            hazard_triggered = True
                 else:
                     closed_start = None
+                    hazard_triggered = False
+                    alarm_action.stop()
                     status_text = "Conductor alerta"
                     status_color = (0, 255, 0)
 
@@ -219,6 +278,7 @@ def run_monitor(config: DrowsinessConfig, camera_index: int) -> None:
                 break
 
     finally:
+        alarm_action.close()
         cap.release()
         cv2.destroyAllWindows()
         face_mesh.close()
@@ -233,14 +293,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-closed-seconds",
         type=float,
-        default=1.5,
-        help="Segundos mínimos de ojo cerrado para detectar somnolencia",
-    )
-    parser.add_argument(
-        "--cooldown-seconds",
-        type=float,
-        default=8.0,
-        help="Tiempo mínimo entre alertas consecutivas",
+        default=5.0,
+        help="Segundos continuos de ojo cerrado antes de activar la alarma",
     )
     return parser.parse_args()
 
@@ -250,7 +304,6 @@ def main() -> None:
     cfg = DrowsinessConfig(
         ear_threshold=args.ear_threshold,
         min_closed_seconds=args.min_closed_seconds,
-        cooldown_seconds=args.cooldown_seconds,
     )
     run_monitor(cfg, camera_index=args.camera)
 
